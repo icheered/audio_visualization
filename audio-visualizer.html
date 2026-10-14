@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Aurora — Audio Visualizer</title>
+<style>
+  :root{
+    --bg:#05060b; --ui:rgba(18,20,32,.72); --line:rgba(255,255,255,.09);
+    --txt:#e8eaf6; --dim:#8b90ad;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);overflow:hidden;color:var(--txt);
+    font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  body.idle.live{cursor:none}
+  canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
+  body::after{ /* soft vignette */
+    content:"";position:fixed;inset:0;pointer-events:none;
+    background:radial-gradient(ellipse at center,transparent 52%,rgba(0,0,0,.6) 100%);
+  }
+
+  #intro{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    text-align:center;pointer-events:none;z-index:2;transition:opacity 1s ease;padding:0 24px}
+  #intro h1{margin:0 0 14px;font-weight:200;font-size:clamp(34px,6vw,64px);letter-spacing:.42em;padding-left:.42em;
+    background:linear-gradient(90deg,#ff6fb5,#a58bff,#5de0ff);-webkit-background-clip:text;background-clip:text;color:transparent;
+    filter:drop-shadow(0 0 24px rgba(160,130,255,.35))}
+  #intro p{margin:0;color:var(--dim);font-size:15px;line-height:1.6;max-width:460px;text-shadow:0 1px 12px #000}
+  #intro p b{color:var(--txt);font-weight:600}
+  #intro small{display:block;margin-top:10px;color:#5c6182;font-size:12px;letter-spacing:.08em;text-transform:uppercase}
+  body.live #intro{opacity:0}
+
+  #bar{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:5;
+    display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:10px;
+    padding:10px 12px;max-width:calc(100vw - 24px);
+    background:var(--ui);border:1px solid var(--line);border-radius:18px;
+    backdrop-filter:blur(18px) saturate(1.4);-webkit-backdrop-filter:blur(18px) saturate(1.4);
+    box-shadow:0 10px 40px rgba(0,0,0,.45);transition:opacity .5s ease,transform .5s ease}
+  #bar.hide{opacity:0;pointer-events:none;transform:translateX(-50%) translateY(12px)}
+  select,button{font:inherit;font-size:13px;color:var(--txt);background:rgba(255,255,255,.06);
+    border:1px solid var(--line);border-radius:11px;padding:8px 12px;outline:none}
+  select{max-width:250px}
+  select option{background:#14162a;color:#eee}
+  button{cursor:pointer;transition:background .2s,border-color .2s,transform .1s}
+  button:hover{background:rgba(255,255,255,.12)}
+  button:active{transform:scale(.97)}
+  button:focus-visible,select:focus-visible{border-color:#a58bff}
+  button.primary{background:linear-gradient(135deg,#8a5cff,#ff5fb0);border-color:transparent;font-weight:600;color:#fff;min-width:96px}
+  button.primary:hover{filter:brightness(1.1)}
+  .seg{display:flex;gap:4px;padding:3px;background:rgba(255,255,255,.04);border-radius:13px;border:1px solid var(--line)}
+  .seg button{border:0;background:transparent;padding:6px 12px;border-radius:10px;color:var(--dim)}
+  .seg button.on{background:rgba(255,255,255,.14);color:#fff}
+  label.sens{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim)}
+  input[type=range]{accent-color:#a58bff;width:90px}
+  .dot{width:8px;height:8px;border-radius:50%;background:#444a66;transition:background .3s,box-shadow .3s}
+  body.live .dot{background:#5df0b0;box-shadow:0 0 10px #5df0b0}
+
+  #toast{position:fixed;left:50%;bottom:96px;transform:translateX(-50%) translateY(8px);z-index:6;
+    background:rgba(40,16,30,.88);border:1px solid rgba(255,120,160,.35);color:#ffd5e2;
+    padding:10px 16px;border-radius:12px;font-size:13px;max-width:min(520px,calc(100vw - 32px));text-align:center;
+    opacity:0;pointer-events:none;transition:opacity .3s,transform .3s}
+  #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+
+<div id="intro">
+  <h1>AURORA</h1>
+  <p>Choose an audio source below and press <b>Listen</b>.<br>Keys: <b>1 2 3</b> modes · <b>F</b> fullscreen · <b>H</b> hide controls</p>
+  <small>Demo signal playing</small>
+</div>
+
+<div id="bar">
+  <span class="dot" title="Status"></span>
+  <select id="src" aria-label="Audio source"></select>
+  <button id="go" class="primary">Listen</button>
+  <div class="seg" id="modes">
+    <button data-mode="aura" class="on">Aura</button>
+    <button data-mode="bars">Bars</button>
+    <button data-mode="waves">Waves</button>
+  </div>
+  <label class="sens">Sensitivity <input id="sens" type="range" min="0.4" max="2.5" step="0.05" value="1"></label>
+  <button id="fs" title="Fullscreen (F)">⛶</button>
+</div>
+<div id="toast"></div>
+
+<script>
+(() => {
+'use strict';
+
+/* ───────────────────────── setup ───────────────────────── */
+const N = 96;                                   // spectrum bands
+const cv = document.getElementById('cv');
+const g  = cv.getContext('2d');
+const $  = id => document.getElementById(id);
+const sel = $('src'), goBtn = $('go'), bar = $('bar'), toastEl = $('toast');
+
+let W = 0, H = 0, DPR = 1;
+function resize(){
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  g.globalCompositeOperation = 'source-over';
+  g.fillStyle = '#05060b'; g.fillRect(0, 0, W, H);
+}
+addEventListener('resize', resize);
+resize();
+
+const S = {
+  mode:'aura', sens:1, live:false, t:0,
+  bands:new Float32Array(N),   // raw, normalised
+  disp:new Float32Array(N),    // temporally smoothed
+  sm:new Float32Array(N),      // spatially smoothed (for drawing)
+  peaks:new Float32Array(N),
+  wave:new Float32Array(256),
+  bass:0, mid:0, high:0, level:0, beat:0, bassAvg:0, lastBeat:-1, agc:0.4
+};
+
+const hsl = (h,s,l,a=1) => `hsla(${(((h%360)+360)%360).toFixed(1)},${s}%,${l}%,${a})`;
+// palette: low frequencies = magenta, mids = violet/blue, highs = teal; drifts slowly
+const hueAt = x => 322 - 150 * x + 18 * Math.sin(S.t * 0.07) + S.t * 2.5;
+const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+function samp(arr, f){
+  const n = arr.length; f = clamp(f, 0, n - 1);
+  const i = f | 0, j = Math.min(n - 1, i + 1), t = f - i;
+  return arr[i] * (1 - t) + arr[j] * t;
+}
+
+/* ───────────────────────── audio ───────────────────────── */
+let actx = null, analyser = null, srcNode = null, stream = null;
+let freqData = null, timeData = null, edges = null;
+
+function ensureAudio(){
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) throw new Error('Web Audio is not supported in this browser.');
+  if (!actx) actx = new AC();
+  if (!analyser){
+    analyser = actx.createAnalyser();
+    analyser.fftSize = 4096;
+    analyser.smoothingTimeConstant = 0.5;
+    analyser.minDecibels = -90;
+    analyser.maxDecibels = -18;
+    freqData = new Uint8Array(analyser.frequencyBinCount);
+    timeData = new Uint8Array(analyser.fftSize);
+  }
+  // log-spaced band edges (fractional bin positions)
+  const nyq = actx.sampleRate / 2, binHz = nyq / analyser.frequencyBinCount;
+  const fmin = 35, fmax = Math.min(16000, nyq * 0.95);
+  edges = new Float32Array(N + 1);
+  for (let i = 0; i <= N; i++) edges[i] = fmin * Math.pow(fmax / fmin, i / N) / binHz;
+}
+
+function stopSource(){
+  if (srcNode){ try{ srcNode.disconnect(); }catch(e){} srcNode = null; }
+  if (stream){ stream.getTracks().forEach(t => { t.onended = null; t.stop(); }); stream = null; }
+}
+
+async function startStream(kind, deviceId){
+  if (!navigator.mediaDevices) throw new Error('Audio capture needs a secure context (https://, localhost or a local file).');
+  ensureAudio();
+  await actx.resume();
+  stopSource();
+  let st;
+  const raw = { echoCancellation:false, noiseSuppression:false, autoGainControl:false };
+  if (kind === 'display'){
+    st = await navigator.mediaDevices.getDisplayMedia({ video:true, audio:raw });
+    if (!st.getAudioTracks().length){
+      st.getTracks().forEach(t => t.stop());
+      throw new Error('No audio was shared. Tick “Share audio” in the picker (works best with a browser tab).');
+    }
+    st.getVideoTracks().forEach(t => t.stop());
+  } else {
+    const a = Object.assign({}, raw);
+    if (deviceId) a.deviceId = { exact: deviceId };
+    st = await navigator.mediaDevices.getUserMedia({ audio: a });
+  }
+  stream = st;
+  srcNode = actx.createMediaStreamSource(st);
+  srcNode.connect(analyser);             // not connected to speakers → no feedback
+  st.getAudioTracks()[0].onended = () => { stopSource(); setLive(false); started = false; toast('Audio source ended — back to demo.'); };
+  return st;
+}
+
+/* ───────────────────────── UI ───────────────────────── */
+let started = false;
+let currentMicId = null;
+
+async function refreshDevices(keep){
+  let mics = [];
+  try {
+    const ds = await navigator.mediaDevices.enumerateDevices();
+    mics = ds.filter(d => d.kind === 'audioinput' && d.deviceId && d.deviceId !== 'communications');
+  } catch(e){}
+  sel.innerHTML = '';
+  const add = (v, t) => { const o = document.createElement('option'); o.value = v; o.textContent = t; sel.appendChild(o); };
+  if (mics.some(m => m.label)){
+    mics.forEach((m, i) => add('mic:' + m.deviceId, m.label || ('Microphone ' + (i + 1))));
+  } else add('mic:default', 'Microphone (default)');
+  add('display', 'Tab / system audio…');
+  add('demo', 'Demo signal (no input)');
+  let want = keep;
+  if (want === 'mic:default' && currentMicId) want = 'mic:' + currentMicId;
+  if ([...sel.options].some(o => o.value === want)) sel.value = want;
+}
+
+function setLive(on){
+  S.live = on;
+  document.body.classList.toggle('live', on);
+  goBtn.textContent = on ? 'Stop' : 'Listen';
+  if (on) scheduleHide(); else showBar();
+}
+
+async function begin(){
+  const v = sel.value;
+  try {
+    if (v === 'demo'){ stopSource(); started = false; setLive(false); return; }
+    if (v === 'display') await startStream('display');
+    else {
+      const id = v.slice(4);
+      await startStream('mic', id === 'default' ? null : id);
+      try { currentMicId = stream.getAudioTracks()[0].getSettings().deviceId || null; } catch(e){}
+    }
+    started = true;
+    setLive(true);
+    S.agc = 0.4;
+    await refreshDevices(v);
+  } catch(e){
+    started = false;
+    setLive(false);
+    toast(friendly(e));
+  }
+}
+
+function friendly(e){
+  if (!e) return 'Something went wrong.';
+  if (e.name === 'NotAllowedError') return 'Access was blocked. Allow audio permission in your browser and try again.';
+  if (e.name === 'NotFoundError') return 'No audio input device was found.';
+  if (e.name === 'NotReadableError') return 'The audio device is busy or unavailable.';
+  return e.message || String(e);
+}
+
+goBtn.addEventListener('click', () => { if (S.live){ stopSource(); started = false; setLive(false); } else begin(); });
+sel.addEventListener('change', () => { if (started || S.live) begin(); });
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener)
+  navigator.mediaDevices.addEventListener('devicechange', () => refreshDevices(sel.value));
+
+$('sens').addEventListener('input', e => S.sens = parseFloat(e.target.value));
+$('modes').addEventListener('click', e => { const b = e.target.closest('button'); if (b) setMode(b.dataset.mode); });
+function setMode(m){
+  S.mode = m;
+  document.querySelectorAll('#modes button').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
+  g.globalCompositeOperation = 'source-over'; g.fillStyle = '#05060b'; g.fillRect(0, 0, W, H);
+}
+function toggleFS(){
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen && document.documentElement.requestFullscreen();
+}
+$('fs').addEventListener('click', toggleFS);
+
+let hideTimer = null, manualHidden = false;
+function showBar(){ document.body.classList.remove('idle'); if (!manualHidden) bar.classList.remove('hide'); clearTimeout(hideTimer); }
+function scheduleHide(){
+  clearTimeout(hideTimer);
+  if (!S.live) return;
+  hideTimer = setTimeout(() => { if (S.live && document.activeElement !== sel){ bar.classList.add('hide'); document.body.classList.add('idle'); } }, 3500);
+}
+['mousemove','mousedown','touchstart'].forEach(ev => addEventListener(ev, () => { showBar(); scheduleHide(); }, {passive:true}));
+addEventListener('keydown', e => {
+  if (e.target === sel) return;
+  const k = e.key.toLowerCase();
+  if (k === '1') setMode('aura'); else if (k === '2') setMode('bars'); else if (k === '3') setMode('waves');
+  else if (k === 'f') toggleFS();
+  else if (k === 'h'){ manualHidden = !manualHidden; bar.classList.toggle('hide', manualHidden); }
+  showBar(); scheduleHide();
+});
+
+let toastTimer = null;
+function toast(msg){
+  toastEl.textContent = msg; toastEl.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => toastEl.classList.remove('show'), 5500);
+}
+
+/* ───────────────────────── analysis ───────────────────────── */
+function analyse(dt){
+  const b = S.bands;
+  if (S.live && analyser){
+    analyser.getByteFrequencyData(freqData);
+    analyser.getByteTimeDomainData(timeData);
+    let fmax = 0;
+    for (let i = 0; i < N; i++){
+      const lo = edges[i], hi = edges[i + 1];
+      let v;
+      if (hi - lo < 1){
+        v = samp(freqData, (lo + hi) * 0.5) / 255;               // interpolate narrow bass bands
+      } else {
+        const a = Math.floor(lo), z = Math.min(freqData.length - 1, Math.ceil(hi));
+        let sum = 0, mx = 0, c = 0;
+        for (let k = a; k <= z; k++){ const x = freqData[k]; sum += x; if (x > mx) mx = x; c++; }
+        v = (0.5 * mx + 0.5 * sum / c) / 255;
+      }
+      v *= 0.8 + 0.6 * (i / N);                                   // gentle treble tilt
+      v = Math.pow(v, 1.7);                                       // more contrast
+      b[i] = v; if (v > fmax) fmax = v;
+    }
+    S.agc = Math.max(fmax, S.agc * Math.pow(0.5, dt / 6));         // slow auto-gain (6 s half-life)
+    const gain = 0.9 * S.sens / Math.max(S.agc, 0.2);
+    for (let i = 0; i < N; i++) b[i] = Math.min(1.15, b[i] * gain);
+    const step = timeData.length / 256;
+    for (let i = 0; i < 256; i++) S.wave[i] = (timeData[Math.floor(i * step)] - 128) / 128 * Math.min(2, S.sens);
+  } else {
+    demo();
+  }
+
+  // beat detection on raw bass
+  let bassRaw = 0; for (let i = 0; i < 10; i++) bassRaw += b[i]; bassRaw /= 10;
+  if (bassRaw > S.bassAvg * 1.3 + 0.08 && S.t - S.lastBeat > 0.16){ S.beat = 1; S.lastBeat = S.t; }
+  S.bassAvg += (bassRaw - S.bassAvg) * (1 - Math.exp(-dt * 1.5));
+  S.beat *= Math.exp(-dt * 5);
+
+  // temporal smoothing: fast attack, slow release
+  const up = 1 - Math.exp(-dt * 28), down = 1 - Math.exp(-dt * 7);
+  for (let i = 0; i < N; i++){
+    const d = S.disp[i], v = b[i];
+    S.disp[i] = d + (v - d) * (v > d ? up : down);
+    S.peaks[i] = Math.max(S.disp[i], S.peaks[i] - dt * 0.35);
+  }
+  // spatial smoothing (1-2-1)
+  for (let i = 0; i < N; i++){
+    const a = S.disp[Math.max(0, i - 1)], c = S.disp[Math.min(N - 1, i + 1)];
+    S.sm[i] = (a + 2 * S.disp[i] + c) * 0.25;
+  }
+  let bs = 0, md = 0, hi = 0;
+  for (let i = 0; i < 10; i++) bs += S.sm[i];
+  for (let i = 10; i < 46; i++) md += S.sm[i];
+  for (let i = 46; i < N; i++) hi += S.sm[i];
+  S.bass = bs / 10; S.mid = md / 36; S.high = hi / (N - 46);
+  S.level = (bs + md + hi) / N;
+}
+
+function demo(){
+  const t = S.t, b = S.bands, bpm = 118, beats = t * bpm / 60;
+  const kick = Math.exp(-(beats % 1) * 5.5);
+  const hat  = Math.exp(-((beats * 2) % 1) * 9) * 0.6;
+  const g2 = (x, c, w) => Math.exp(-Math.pow((x - c) / w, 2));
+  for (let i = 0; i < N; i++){
+    const x = i / N;
+    let v = kick * g2(x, 0.08, 0.09) * 0.95;
+    v += (0.45 + 0.25 * Math.sin(t * 0.9)) * g2(x, 0.32 + 0.12 * Math.sin(t * 0.6), 0.14);
+    v += (0.35 + 0.2 * Math.sin(t * 1.7 + 1)) * g2(x, 0.6 + 0.1 * Math.sin(t * 0.45 + 2), 0.12);
+    v += hat * g2(x, 0.85, 0.14) * 0.7;
+    v *= (0.8 + 0.2 * Math.sin(i * 2.3 + t * 7)) * (1 - x * 0.25);
+    b[i] = clamp(v, 0, 1);
+  }
+  for (let i = 0; i < 256; i++){
+    const u = i / 256 * Math.PI * 2;
+    S.wave[i] = Math.sin(u * 3 + t * 4) * 0.4 * (0.4 + kick) + Math.sin(u * 7 - t * 2) * 0.2;
+  }
+}
+
+/* ───────────────────────── drawing helpers ───────────────────────── */
+function backdrop(alpha){
+  g.globalCompositeOperation = 'source-over';
+  g.fillStyle = `rgba(5,6,11,${alpha})`; g.fillRect(0, 0, W, H);
+}
+function ambient(cx, cy, r, a){
+  const gr = g.createRadialGradient(cx, cy, 0, cx, cy, r);
+  gr.addColorStop(0, hsl(hueAt(0.2), 80, 45, a));
+  gr.addColorStop(1, hsl(hueAt(0.2), 80, 45, 0));
+  g.globalCompositeOperation = 'lighter';
+  g.fillStyle = gr; g.fillRect(0, 0, W, H);
+}
+function rr(x, y, w, h, r){
+  r = Math.min(r, w / 2, h / 2);
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+/* ───────────────────────── mode: AURA ───────────────────────── */
+const P = [];
+function spawn(cx, cy, R, n, speedBoost){
+  for (let k = 0; k < n && P.length < 520; k++){
+    const a = Math.random() * Math.PI * 2, sp = (28 + Math.random() * 80) * speedBoost;
+    P.push({ x:cx + Math.cos(a) * R, y:cy + Math.sin(a) * R, vx:Math.cos(a) * sp, vy:Math.sin(a) * sp,
+             life:1, decay:0.22 + Math.random() * 0.5, size:0.8 + Math.random() * 2.1, f:Math.random() });
+  }
+}
+
+function drawAura(dt){
+  const cx = W / 2, cy = H / 2, m = Math.min(W, H);
+  backdrop(0.22);
+  const R0 = m * 0.16 * (1 + S.bass * 0.12 + S.beat * 0.06);
+  const maxL = m * 0.27;
+  ambient(cx, cy, m * 0.6, 0.05 + S.bass * 0.16 + S.beat * 0.06);
+
+  g.globalCompositeOperation = 'lighter';
+  g.lineCap = 'round';
+  const M = N, pitch = 2 * Math.PI * R0 / (M * 2), lw = Math.max(1.6, pitch * 0.55);
+
+  for (let pass = 0; pass < 3; pass++){
+    for (let side = 0; side < 2; side++){
+      for (let i = 0; i < M; i++){
+        const v = Math.min(S.sm[i], 1.1), f = i / (M - 1);
+        const ang = Math.PI / 2 + (side ? -1 : 1) * (i + 0.5) / M * Math.PI;   // bass at bottom, highs at top
+        const c = Math.cos(ang), s = Math.sin(ang);
+        const len = m * 0.004 + Math.pow(v, 0.95) * maxL;
+        const hue = hueAt(f);
+        let r0 = R0, r1 = R0 + len;
+        if (pass === 0){ g.lineWidth = lw * 3.4; g.strokeStyle = hsl(hue, 90, 55, 0.07 + v * 0.06); }
+        else if (pass === 1){ g.lineWidth = lw; g.strokeStyle = hsl(hue, 90, 56 + Math.min(v, 1) * 20, 0.9); }
+        else { r0 = R0 * 0.93; r1 = r0 - len * 0.22; g.lineWidth = lw * 0.8; g.strokeStyle = hsl(hue, 80, 60, 0.22); }
+        g.beginPath(); g.moveTo(cx + c * r0, cy + s * r0); g.lineTo(cx + c * r1, cy + s * r1); g.stroke();
+      }
+    }
+  }
+
+  // thin base ring
+  g.lineWidth = 1.2; g.strokeStyle = hsl(hueAt(0.5), 80, 70, 0.22 + S.beat * 0.35);
+  g.beginPath(); g.arc(cx, cy, R0 * 0.975, 0, Math.PI * 2); g.stroke();
+
+  // waveform ring (mirrored so it closes smoothly)
+  const K = 128, w = S.wave, rot = S.t * 0.1 - Math.PI / 2;
+  const rw = R0 * (0.10 + S.bass * 0.28);
+  for (let pass = 0; pass < 2; pass++){
+    g.beginPath();
+    for (let j = 0; j <= K * 2; j++){
+      const jj = j % (K * 2), k = jj < K ? jj : (K * 2 - 1 - jj);
+      const val = (w[k * 2] + w[k * 2 + 1]) * 0.5;
+      const a = jj / (K * 2) * Math.PI * 2 + rot, r = R0 * 0.82 + val * rw;
+      const x = cx + Math.cos(a) * r, y = cy + Math.sin(a) * r;
+      j ? g.lineTo(x, y) : g.moveTo(x, y);
+    }
+    g.closePath();
+    g.lineWidth = pass ? 1.6 : 7;
+    g.strokeStyle = hsl(hueAt(0.45), 85, 68, pass ? 0.75 : 0.10);
+    g.stroke();
+  }
+
+  // soft core
+  const core = g.createRadialGradient(cx, cy, 0, cx, cy, R0 * 0.8);
+  core.addColorStop(0, hsl(hueAt(0.3), 85, 62, 0.10 + S.bass * 0.30 + S.beat * 0.12));
+  core.addColorStop(1, hsl(hueAt(0.3), 85, 50, 0));
+  g.fillStyle = core; g.beginPath(); g.arc(cx, cy, R0 * 0.8, 0, Math.PI * 2); g.fill();
+
+  // particles
+  const rate = 8 + S.level * 90 + S.high * 40;
+  spawn(cx, cy, R0 + maxL * 0.35 * S.level, Math.floor(rate * dt + Math.random()), 0.6 + S.level);
+  if (S.beat > 0.97) spawn(cx, cy, R0 * 1.05, 16, 1.4);
+  for (let i = P.length - 1; i >= 0; i--){
+    const p = P[i];
+    p.life -= p.decay * dt;
+    if (p.life <= 0){ P.splice(i, 1); continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    const damp = Math.exp(-dt * 0.5); p.vx *= damp; p.vy *= damp;
+    g.fillStyle = hsl(hueAt(p.f), 90, 72, p.life * 0.75);
+    g.beginPath(); g.arc(p.x, p.y, p.size * (0.5 + p.life * 0.5), 0, Math.PI * 2); g.fill();
+  }
+}
+
+/* ───────────────────────── mode: BARS ───────────────────────── */
+function drawBars(){
+  backdrop(1);
+  const base = H * 0.60, maxH = H * 0.46;
+  ambient(W / 2, base, Math.max(W, H) * 0.6, 0.04 + S.bass * 0.12 + S.beat * 0.05);
+  const nb = clamp(Math.floor(W / 17), 28, 72);
+  const pitch = (W * 0.86) / (nb * 2), bw = pitch * 0.62;
+
+  g.globalCompositeOperation = 'lighter';
+  // baseline
+  const bl = g.createLinearGradient(W * 0.05, 0, W * 0.95, 0);
+  bl.addColorStop(0, hsl(hueAt(1), 80, 60, 0)); bl.addColorStop(0.5, hsl(hueAt(0), 80, 70, 0.35)); bl.addColorStop(1, hsl(hueAt(1), 80, 60, 0));
+  g.fillStyle = bl; g.fillRect(W * 0.05, base + 1, W * 0.9, 1.5);
+
+  for (let side = 0; side < 2; side++){
+    for (let j = 0; j < nb; j++){
+      const f = j / (nb - 1), idx = f * (N - 1);
+      const v = Math.min(samp(S.sm, idx), 1.1);
+      const pk = samp(S.peaks, idx);
+      const h = Math.max(4, Math.pow(v, 0.95) * maxH);
+      const x = W / 2 + (side ? 1 : -1) * (j + 0.5) * pitch - bw / 2;
+      const hue = hueAt(f);
+
+      // glow
+      g.globalAlpha = 0.10 + v * 0.06;
+      g.fillStyle = hsl(hue, 90, 55);
+      rr(x - bw * 0.6, base - h - 4, bw * 2.2, h + 8, bw * 1.1); g.fill();
+      g.globalAlpha = 1;
+
+      // body
+      const gr = g.createLinearGradient(0, base - h, 0, base);
+      gr.addColorStop(0, hsl(hue, 92, 68, 1)); gr.addColorStop(1, hsl(hue + 28, 90, 50, 0.9));
+      g.fillStyle = gr; rr(x, base - h, bw, h, bw / 2); g.fill();
+
+      // reflection
+      const rh = h * 0.5;
+      const rg = g.createLinearGradient(0, base + 6, 0, base + 6 + rh);
+      rg.addColorStop(0, hsl(hue, 90, 55, 0.28)); rg.addColorStop(1, hsl(hue, 90, 55, 0));
+      g.fillStyle = rg; rr(x, base + 6, bw, rh, bw / 2); g.fill();
+
+      // falling peak cap
+      g.fillStyle = hsl(hue, 90, 80, 0.8);
+      rr(x, base - pk * maxH - 9, bw, 3, 1.5); g.fill();
+    }
+  }
+}
+
+/* ───────────────────────── mode: WAVES ───────────────────────── */
+function drawWaves(){
+  backdrop(1);
+  const cy = H * 0.5, M = 72, layers = 5;
+  ambient(W / 2, cy, Math.max(W, H) * 0.6, 0.04 + S.bass * 0.14 + S.beat * 0.05);
+  g.globalCompositeOperation = 'lighter';
+  g.lineJoin = 'round';
+
+  const xs = new Float32Array(M), base = new Float32Array(M);
+  for (let p = 0; p < M; p++){
+    xs[p] = p / (M - 1) * W;
+    const u = Math.abs(p / (M - 1) * 2 - 1);                    // 0 centre → 1 edge
+    base[p] = Math.min(samp(S.sm, u * (N - 1) * 0.9), 1.1);     // bass in the middle, treble at the edges
+  }
+  // extra smoothing so curves feel silky
+  const sp = new Float32Array(M);
+  for (let it = 0; it < 2; it++){
+    for (let p = 0; p < M; p++) sp[p] = (base[Math.max(0, p - 1)] + 2 * base[p] + base[Math.min(M - 1, p + 1)]) * 0.25;
+    base.set(sp);
+  }
+
+  for (let L = 0; L < layers; L++){
+    const k = L / (layers - 1), top = new Float32Array(M);
+    for (let p = 0; p < M; p++){
+      const taper = Math.pow(Math.sin(Math.PI * p / (M - 1)), 0.6);
+      const drift = Math.sin(xs[p] * 0.012 * (1 + L * 0.6) + S.t * (0.6 + L * 0.25)) * H * 0.012 * (1 + S.level * 3);
+      const a = (base[p] * (0.55 + 0.5 * (1 - k)) + 0.04) * H * 0.30;
+      top[p] = (a + drift * (0.5 + base[p])) * taper;
+    }
+    const gr = g.createLinearGradient(0, 0, W, 0);
+    const off = L * 12;
+    gr.addColorStop(0,   hsl(hueAt(0.9) + off, 85, 58, 0.14));
+    gr.addColorStop(0.5, hsl(hueAt(0.0) + off, 88, 62, 0.20));
+    gr.addColorStop(1,   hsl(hueAt(0.9) + off, 85, 58, 0.14));
+
+    // closed shape: top edge left→right, bottom edge right→left
+    g.beginPath();
+    g.moveTo(xs[0], cy - top[0]);
+    for (let p = 1; p < M; p++){
+      const mx = (xs[p - 1] + xs[p]) / 2, my = cy - (top[p - 1] + top[p]) / 2;
+      g.quadraticCurveTo(xs[p - 1], cy - top[p - 1], mx, my);
+    }
+    g.lineTo(xs[M - 1], cy - top[M - 1]);
+    g.lineTo(xs[M - 1], cy + top[M - 1]);
+    for (let p = M - 2; p >= 0; p--){
+      const mx = (xs[p + 1] + xs[p]) / 2, my = cy + (top[p + 1] + top[p]) / 2;
+      g.quadraticCurveTo(xs[p + 1], cy + top[p + 1], mx, my);
+    }
+    g.closePath();
+    g.fillStyle = gr; g.fill();
+
+    // crisp edges
+    const eg = g.createLinearGradient(0, 0, W, 0);
+    eg.addColorStop(0,   hsl(hueAt(0.9) + off, 90, 70, 0.0));
+    eg.addColorStop(0.15,hsl(hueAt(0.8) + off, 90, 70, 0.55));
+    eg.addColorStop(0.5, hsl(hueAt(0.0) + off, 92, 76, 0.7));
+    eg.addColorStop(0.85,hsl(hueAt(0.8) + off, 90, 70, 0.55));
+    eg.addColorStop(1,   hsl(hueAt(0.9) + off, 90, 70, 0.0));
+    g.strokeStyle = eg; g.lineWidth = 1.3;
+    for (const sgn of [-1, 1]){
+      g.beginPath(); g.moveTo(xs[0], cy + sgn * top[0]);
+      for (let p = 1; p < M; p++){
+        const mx = (xs[p - 1] + xs[p]) / 2, my = cy + sgn * (top[p - 1] + top[p]) / 2;
+        g.quadraticCurveTo(xs[p - 1], cy + sgn * top[p - 1], mx, my);
+      }
+      g.stroke();
+    }
+  }
+  // centre hairline
+  const cl = g.createLinearGradient(0, 0, W, 0);
+  cl.addColorStop(0, hsl(hueAt(0.9), 80, 70, 0)); cl.addColorStop(0.5, hsl(hueAt(0), 80, 80, 0.4)); cl.addColorStop(1, hsl(hueAt(0.9), 80, 70, 0));
+  g.fillStyle = cl; g.fillRect(0, cy - 0.5, W, 1);
+}
+
+/* ───────────────────────── main loop ───────────────────────── */
+let last = performance.now();
+function frame(now){
+  const dt = Math.min(0.05, Math.max(0.001, (now - last) / 1000));
+  last = now; S.t += dt;
+  analyse(dt);
+  g.lineCap = 'butt'; g.lineJoin = 'miter'; g.globalAlpha = 1;
+  if (S.mode === 'aura') drawAura(dt);
+  else if (S.mode === 'bars') drawBars();
+  else drawWaves();
+  requestAnimationFrame(frame);
+}
+
+refreshDevices('mic:default');
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
